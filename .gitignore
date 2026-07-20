@@ -1,0 +1,30 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Large Datasets & Video Files
+*.mp4
+*.avi
+*.mkv
+egoproactive/val/
+egoconv/val/
+egolongqa/val/
+
+# Feature Caches & Models
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Environment & Secrets
+.env
+hf_token.txt
