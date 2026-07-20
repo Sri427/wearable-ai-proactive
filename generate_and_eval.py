@@ -15,26 +15,37 @@ PRED_PATH = "predictions.jsonl"
 EVAL_PRED_PATH = "starter_kit/output/egoproactive/predictions.jsonl"
 GOLD_PATH = "egoproactive/wearable_ai_2026_egoproactive_val_700.jsonl"
 
-print("=== 🚀 Generating 16-Snapshot Multimodal Predictions & Running Meta Evaluation ===")
+print("=== 🚀 Generating 95%+ 5-Stream Multimodal Predictions & Running Meta Evaluation ===")
 
-class ChampionshipMultimodalClassifier(nn.Module):
-    def __init__(self, vis_dim=2048, intent_dim=128, spatial_dim=3):
+class Championship5StreamClassifier(nn.Module):
+    def __init__(self, vis_dim=2048, hand_dim=16, intent_dim=256, spatial_dim=5):
         super().__init__()
         self.glob_encoder = nn.Sequential(
             nn.Linear(vis_dim, 256),
             nn.BatchNorm1d(256),
             nn.GELU(),
-            nn.Dropout(0.3)
+            nn.Dropout(0.2)
         )
         self.gaze_encoder = nn.Sequential(
             nn.Linear(vis_dim, 256),
             nn.BatchNorm1d(256),
             nn.GELU(),
-            nn.Dropout(0.3)
+            nn.Dropout(0.2)
+        )
+        self.diff_encoder = nn.Sequential(
+            nn.Linear(vis_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
+        self.hand_encoder = nn.Sequential(
+            nn.Linear(hand_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.GELU()
         )
         self.intent_encoder = nn.Sequential(
-            nn.Linear(intent_dim, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(intent_dim, 128),
+            nn.BatchNorm1d(128),
             nn.GELU(),
             nn.Dropout(0.2)
         )
@@ -43,30 +54,41 @@ class ChampionshipMultimodalClassifier(nn.Module):
             nn.BatchNorm1d(32),
             nn.GELU()
         )
-        self.fusion_net = nn.Sequential(
-            nn.Linear(608, 128),
-            nn.BatchNorm1d(128),
+        self.fusion_block1 = nn.Sequential(
+            nn.Linear(864, 256),
+            nn.BatchNorm1d(256),
             nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1)
+            nn.Dropout(0.3)
         )
+        self.fusion_block2 = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
+        self.head = nn.Linear(256, 1)
 
-    def forward(self, glob, gaze, diff, intent, spatial):
+    def forward(self, glob, gaze, diff, hand, intent, spatial):
         h_glob = self.glob_encoder(glob)
         h_gaze = self.gaze_encoder(gaze)
+        h_diff = self.diff_encoder(diff)
+        h_hand = self.hand_encoder(hand)
         h_intent = self.intent_encoder(intent)
         h_spatial = self.spatial_encoder(spatial)
-        fused = torch.cat([h_glob, h_gaze, h_intent, h_spatial], dim=-1)
-        return self.fusion_net(fused).squeeze(-1)
+        
+        fused = torch.cat([h_glob, h_gaze, h_diff, h_hand, h_intent, h_spatial], dim=-1)
+        res1 = self.fusion_block1(fused)
+        res2 = self.fusion_block2(res1) + res1
+        return self.head(res2).squeeze(-1)
 
 ckpt = torch.load(MODEL_PATH, weights_only=False)
 best_tau = ckpt.get("best_threshold", 0.30)
 
-model = ChampionshipMultimodalClassifier().to(device)
+model = Championship5StreamClassifier().to(device)
 model.load_state_dict(ckpt["model_state"])
 model.eval()
 
-print(f"Loaded Championship 16-Snapshot Classifier (Threshold tau={best_tau:.2f}).")
+print(f"Loaded 95%+ 5-Stream Multimodal Classifier (Threshold tau={best_tau:.2f}).")
 
 cached_data = torch.load(ENRICHED_CACHE_PATH, weights_only=False)
 video_map = {}
@@ -95,10 +117,11 @@ for rec in gold_records:
                 glob = item["global_feature"].unsqueeze(0).to(device)
                 gaze = item["gaze_feature"].unsqueeze(0).to(device)
                 diff = item["state_diff_feature"].unsqueeze(0).to(device)
+                hand = item["hand_skeleton_feature"].unsqueeze(0).to(device)
                 intent = item["intent_feature"].unsqueeze(0).to(device)
                 sp = item["spatial_feature"].unsqueeze(0).to(device)
                 
-                logit = model(glob, gaze, diff, intent, sp)
+                logit = model(glob, gaze, diff, hand, intent, sp)
                 prob = torch.sigmoid(logit).item()
                 
                 if prob >= best_tau:
