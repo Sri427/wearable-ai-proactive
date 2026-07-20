@@ -3,7 +3,8 @@ import sys
 import json
 from huggingface_hub import hf_hub_download
 
-HF_TOKEN = "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"
+# Read token from environment variable or fallback
+HF_TOKEN = os.getenv("HF_TOKEN")
 REPO_ID = "facebook/wearable-ai"
 SUBSET_COUNT = 50
 

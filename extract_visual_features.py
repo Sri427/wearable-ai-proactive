@@ -21,23 +21,33 @@ else:
     device = torch.device("cpu")
     print("💻 Using CPU", flush=True)
 
-# 2. Load high-performance visual backbone (ResNet50 / ConvNeXt)
-print("\n📦 Loading visual backbone (ResNet50 feature extractor)...", flush=True)
+# 2. Load high-performance visual backbone
+print("\n📦 Loading ResNet50 visual backbone...", flush=True)
 weights = models.ResNet50_Weights.DEFAULT
 model = models.resnet50(weights=weights)
-model.fc = torch.nn.Identity() # Remove final classifier head to output 2048-dim embedding
+model.fc = torch.nn.Identity()
 model = model.to(device)
 model.eval()
 
-# Preprocessing transforms matching ImageNet standard
 preprocess = weights.transforms()
+
+# Center Gaze Crop Transform (Focus on center 50% of the image where user eyes/gaze look)
+center_crop_transform = transforms.Compose([
+    transforms.CenterCrop(0.5), # 50% center crop
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
 JSONL_PATH = "egoproactive/wearable_ai_2026_egoproactive_val_700.jsonl"
 VIDEO_DIR = "egoproactive/val"
-OUTPUT_CACHE = "cached_proactive_features.pt"
+OUTPUT_CACHE = "cached_proactive_features_16f.pt"
 
-def extract_frames_for_interval(video_path, start_sec, end_sec, num_frames=4):
-    """Extract `num_frames` uniformly spaced PIL Image frames for a given time interval."""
+# High-density frame sampling: 16 snapshots per interval!
+HIGH_DENSITY_FRAMES = 16
+
+def extract_dense_frames(video_path, start_sec, end_sec, num_frames=HIGH_DENSITY_FRAMES):
+    """Extract `num_frames` high-density PIL frames across interval."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []
@@ -67,7 +77,7 @@ def extract_frames_for_interval(video_path, start_sec, end_sec, num_frames=4):
     cap.release()
     return frames
 
-print("\n🔍 Scanning available video files...", flush=True)
+print("\n🔍 Scanning available local video files...", flush=True)
 with open(JSONL_PATH, "r", encoding="utf-8") as f:
     all_records = [json.loads(line) for line in f]
 
@@ -77,13 +87,14 @@ for r in all_records:
     if os.path.exists(v_path) and os.path.getsize(v_path) > 1000:
         local_records.append(r)
 
-print(f"Found {len(local_records)} local videos ready for feature extraction.", flush=True)
+print(f"Found {len(local_records)} local videos ready for 16-snapshot extraction.", flush=True)
 
 dataset_features = []
 
-print("\n🚀 Starting visual feature extraction on M1 GPU...", flush=True)
+print(f"\n🚀 Starting High-Density (16 Snapshots + Center Gaze Crop) Extraction on M1 GPU...", flush=True)
+
 with torch.no_grad():
-    for rec in tqdm(local_records, desc="Extracting Features"):
+    for rec in tqdm(local_records, desc="Extracting 16-Frame Features"):
         v_name = rec["video_path"]
         v_path = os.path.join(VIDEO_DIR, v_name)
         intervals = rec.get("video_intervals", [])
@@ -97,26 +108,41 @@ with torch.no_grad():
                 continue
             
             raw_ans = answers[i_idx]
-            # Binary label: 0 for $silent$, 1 for $interrupt$
             is_interrupt = 1 if "$interrupt$" in raw_ans else 0
             utterance = raw_ans.replace("$interrupt$", "").strip() if is_interrupt else ""
 
-            pil_frames = extract_frames_for_interval(v_path, start, end, num_frames=4)
+            pil_frames = extract_dense_frames(v_path, start, end, num_frames=HIGH_DENSITY_FRAMES)
             if not pil_frames:
                 continue
 
-            # Transform images into tensor batch
-            tensors = torch.stack([preprocess(img) for img in pil_frames]).to(device)
-            # Pass through ResNet50 -> shape (num_frames, 2048)
-            frame_feats = model(tensors)
-            # Mean pool across frames -> shape (2048,)
-            interval_feat = frame_feats.mean(dim=0).cpu()
+            # Stream 1: Global Frame Embeddings (16 frames)
+            global_tensors = torch.stack([preprocess(img) for img in pil_frames]).to(device)
+            global_feats = model(global_tensors) # Shape: (16, 2048)
+            mean_global_feat = global_feats.mean(dim=0).cpu()
+
+            # Stream 2: Center Gaze Focus Embeddings (16 center-cropped gaze frames)
+            gaze_tensors = torch.stack([center_crop_transform(img) for img in pil_frames]).to(device)
+            gaze_feats = model(gaze_tensors) # Shape: (16, 2048)
+            mean_gaze_feat = gaze_feats.mean(dim=0).cpu()
+
+            # Stream 3: Before-vs-After Object State Difference Vector
+            state_diff_feat = (global_feats[-1] - global_feats[0]).cpu()
+
+            # Stream 4: Motion Velocity & Wrist Rotation Proxy (Frame-to-frame delta)
+            if len(global_feats) > 1:
+                frame_deltas = torch.norm(global_feats[1:] - global_feats[:-1], dim=1)
+                motion_velocity = frame_deltas.mean().item()
+            else:
+                motion_velocity = 0.0
 
             dataset_features.append({
                 "video_path": v_name,
                 "interval_index": i_idx,
                 "interval": [start, end],
-                "feature": interval_feat,
+                "global_feature": mean_global_feat,         # 2048-dim
+                "gaze_feature": mean_gaze_feat,             # 2048-dim
+                "state_diff_feature": state_diff_feat,      # 2048-dim
+                "motion_velocity": motion_velocity,         # Float
                 "label": is_interrupt,
                 "utterance": utterance,
                 "query": query,
@@ -124,6 +150,6 @@ with torch.no_grad():
                 "domain": domain
             })
 
-print(f"\n✅ Extracted visual features for {len(dataset_features)} decision intervals across {len(local_records)} videos!", flush=True)
+print(f"\n✅ Extracted 16-snapshot + gaze features for {len(dataset_features)} decision intervals!", flush=True)
 torch.save(dataset_features, OUTPUT_CACHE)
 print(f"💾 Saved cached features to: {OUTPUT_CACHE} ({os.path.getsize(OUTPUT_CACHE)/(1024*1024):.2f} MB)", flush=True)
